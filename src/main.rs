@@ -17,7 +17,6 @@ struct Args {
     config: PathBuf,
 }
 
-
 #[derive(Debug, Deserialize, Serialize, Clone)]
 struct SSHInfo {
     host: String,
@@ -44,82 +43,69 @@ struct Job {
     files: Vec<FilePair>,
 }
 
+fn retry<T, E, F>(mut f: F) -> Result<T, E>
+where
+    F: FnMut() -> Result<T, E>,
+    E: std::fmt::Debug,
+{
+    let mut attempts = 0;
+    loop {
+        match f() {
+            Ok(val) => return Ok(val),
+            Err(e) => {
+                attempts += 1;
+                if attempts >= 5 {
+                    return Err(e);
+                }
+                eprintln!("Attempt {} failed: {:?}. Retrying...", attempts, e);
+                thread::sleep(Duration::from_secs(1));
+            }
+        }
+    }
+}
+
 fn create_ssh_session(host: &SSHInfo, key_path: &str) -> Result<Session, Box<dyn std::error::Error>> {
-    let tcp = TcpStream::connect(format!("{}:22", host.host))?;
-    let mut sess = Session::new()?;
-    sess.set_tcp_stream(tcp);
-    sess.handshake()?;
-    sess.userauth_pubkey_file(&host.user, None, Path::new(key_path), None)?;
-    Ok(sess)
+    retry(|| {
+        let tcp = TcpStream::connect(format!("{}:22", host.host))?;
+        let mut sess = Session::new()?;
+        sess.set_tcp_stream(tcp);
+        sess.handshake()?;
+        sess.userauth_pubkey_file(&host.user, None, Path::new(key_path), None)?;
+        Ok(sess)
+    })
 }
 
 fn check_first_deploy(sess: &Session) -> bool {
-    for _ in 0..5 {
-        let mut channel: Channel;
-
-        match sess.channel_session() {
-            Ok(val) => {
-                channel = val
-            }
-            Err(err) => {
-                eprintln!("Error: {:?}", err);
-                continue;
-            }
-        }
-
-        match channel.exec("cat /tmp/first_deploy_complete") {
-            Ok(_) => {
-            }
-            Err(err) => {
-                eprintln!("Error: {:?}", err);
-                continue;
-            }
-        }
-
+    let result = retry(|| {
+        let mut channel = sess.channel_session()?;
+        channel.exec("cat /tmp/first_deploy_complete")?;
         let mut s = String::new();
-
-        match channel.read_to_string(&mut s) {
-            Ok(_) => {
-            }
-            Err(err) => {
-                eprintln!("Error: {:?}", err);
-                continue;
-            }
-        }
-
-        return s == "true".to_string()
-    }
-    return false
+        channel.read_to_string(&mut s)?;
+        Ok(s == "true".to_string())
+    });
+    result.unwrap_or(false)
 }
 
 fn write_first_deploy(sess: &Session) -> Result<(), Box<dyn std::error::Error>> {
-    for _ in 0..5 {
+    retry(|| {
         let mut channel = sess.channel_session()?;
-        match channel.exec("echo -ne 'true' > /tmp/first_deploy_complete") {
-            Ok(_) => {
-            }
-            Err(err) => {
-                eprintln!("Error: {:?}", err);
-                continue;
-            }
-        }
-        return Ok(())
-    }
-
-    return Err(Box::new(std::io::Error::new(
-        std::io::ErrorKind::Other,
-        "failed after retries",
-    )))
+        channel.exec("echo -ne 'true' > /tmp/first_deploy_complete")?;
+        Ok(())
+    })
 }
 
 fn deploy_files(sess: &Session, files: &[FilePair]) -> Result<(), Box<dyn std::error::Error>> {
     for pair in files {
-        let content = fs::read(&pair.src)?;
-        let mut remote_file = sess.scp_send(Path::new(&pair.dest), 0o644, content.len() as u64, None)?;
-        remote_file.write_all(&content)?;
-        remote_file.send_eof()?;
-        remote_file.wait_eof()?;
-        remote_file.close()?;
+        retry(|| {
+            let content = fs::read(&pair.src).map_err(|e| Box::new(e) as Box<dyn std::error::Error>)?;
+            let mut remote_file = sess.scp_send(Path::new(&pair.dest), 0o644, content.len() as u64, None)
+                .map_err(|e| Box::new(e) as Box<dyn std::error::Error>)?;
+            remote_file.write_all(&content).map_err(|e| Box::new(e) as Box<dyn std::error::Error>)?;
+            remote_file.send_eof().map_err(|e| Box::new(e) as Box<dyn std::error::Error>)?;
+            remote_file.wait_eof().map_err(|e| Box::new(e) as Box<dyn std::error::Error>)?;
+            remote_file.close().map_err(|e| Box::new(e) as Box<dyn std::error::Error>)?;
+            Ok(())
+        })?;
     }
     Ok(())
 }
@@ -132,7 +118,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let (tx, rx): (Sender<Job>, Receiver<Job>) = unbounded();
 
     // Worker Thread
-    let worker_tx = tx.clone();
     let worker_conf = config.clone();
     thread::spawn(move || {
         while let Ok(job) = rx.recv() {
