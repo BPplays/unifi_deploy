@@ -1,0 +1,12 @@
+[package]
+name = "unifi_deploy"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+serde = { version = "1.0", features = ["derive"] }
+serde_yaml = "0.9"
+clap = { version = "4.0", features = ["derive"] }
+ssh2 = "0.9"
+crossbeam-channel = "0.5"
+
