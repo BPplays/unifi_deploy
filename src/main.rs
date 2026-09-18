@@ -12,6 +12,11 @@ use clap::Parser;
 use serde::{Deserialize, Serialize};
 use sha3::{Digest, Sha3_256};
 use ssh2::{Session, Sftp};
+use russh::{
+    client,
+    keys::{load_secret_key, PrivateKeyWithHashAlg},
+    ChannelId,
+};
 
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
@@ -141,40 +146,76 @@ fn run_job(job: &Job, ssh_key: &str) -> Result<()> {
     Ok(())
 }
 
-fn connect_ssh(host: &SSHInfo, ssh_key: &str) -> Result<Session> {
-    let address = format!("{}:22", host.host);
+struct ClientHandler;
 
-    let tcp = TcpStream::connect(&address)
-        .with_context(|| format!("failed to connect to {address}"))?;
+impl client::Handler for ClientHandler {
+    type Error = anyhow::Error;
 
-    let mut session = Session::new()
-        .context("failed to create SSH session")?;
+    async fn check_server_key(
+        &mut self,
+        _server_public_key: &russh::keys::PublicKeyOrCertificate,
+    ) -> Result<bool, Self::Error> {
+        /*
+         * Do not blindly return true in a production program.
+         *
+         * This is equivalent to accepting any host key, which is
+         * convenient while getting the synchronization program working.
+         */
+        Ok(true)
+    }
+}
 
-    session.set_tcp_stream(tcp);
-    session.handshake()
-        .with_context(|| format!("SSH handshake failed for {}", host.host))?;
+async fn connect_ssh(
+    host: &SSHInfo,
+    ssh_key: &str,
+) -> Result<russh::client::Handle<ClientHandler>> {
+    let key = load_secret_key(Path::new(ssh_key), None)
+        .with_context(|| {
+            format!("failed to load SSH private key: {ssh_key}")
+        })?;
 
-    session
-        .userauth_pubkey_file(
-            &host.user,
-            None,
-            Path::new(ssh_key),
-            None,
-        )
+    let config = russh::client::Config {
+        inactivity_timeout: Some(std::time::Duration::from_secs(30)),
+        ..Default::default()
+    };
+
+    let mut session = client::connect(
+        Arc::new(config),
+        (host.host.as_str(), 22),
+        ClientHandler,
+    )
+    .await
+    .with_context(|| {
+        format!("failed to connect to {}:22", host.host)
+    })?;
+
+    let key = PrivateKeyWithHashAlg::new(
+        Arc::new(key),
+        session.best_supported_rsa_hash().await?.flatten(),
+    );
+
+    let auth = session
+        .authenticate_publickey(&host.user, key)
+        .await
         .with_context(|| {
             format!(
-                "SSH public-key authentication failed for {}@{}",
+                "public-key authentication failed for {}@{}",
                 host.user, host.host
             )
         })?;
 
-    if !session.authenticated() {
+    if !auth.success() {
         bail!(
-            "SSH authentication failed for {}@{}",
+            "SSH server rejected public-key authentication for {}@{}",
             host.user,
             host.host
         );
     }
+
+    println!(
+        "authenticated {}@{}",
+        host.user, host.host
+    );
 
     Ok(session)
 }
