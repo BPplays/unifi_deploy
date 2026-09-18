@@ -11,6 +11,7 @@ use clap::Parser;
 use russh::{
     client,
     keys::{load_secret_key, PrivateKeyWithHashAlg},
+    ChannelMsg,
 };
 use russh_sftp::{
     client::SftpSession,
@@ -24,6 +25,10 @@ use tokio::{
     time::sleep,
 };
 
+const SFTP_REQUEST_TIMEOUT_SECS: u64 = 30;
+const SSH_INACTIVITY_TIMEOUT_SECS: u64 = 120;
+const IO_BUFFER_SIZE: usize = 64 * 1024;
+
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
 struct Args {
@@ -31,10 +36,23 @@ struct Args {
     config: PathBuf,
 }
 
+/// `sftp` means "try SFTP first, then fall back to SSH".
+/// `ssh` means "skip SFTP and use plain SSH".
+#[derive(Debug, Deserialize, Serialize, Clone, Copy, Default)]
+#[serde(rename_all = "lowercase")]
+enum TransferMethod {
+    #[default]
+    Sftp,
+    Ssh,
+}
+
 #[derive(Debug, Deserialize, Serialize, Clone)]
 struct SSHInfo {
     host: String,
     user: String,
+
+    #[serde(default)]
+    transfer_method: TransferMethod,
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
@@ -57,15 +75,11 @@ struct Job {
     files: Vec<FilePair>,
 }
 
-/*
- * SSH client handler.
- *
- * IMPORTANT:
- * check_server_key() currently accepts any server key.
- *
- * That is convenient while getting the program working, but it
- * should eventually verify ~/.ssh/known_hosts.
- */
+enum Transport {
+    Sftp(SftpSession),
+    Ssh,
+}
+
 struct ClientHandler;
 
 impl client::Handler for ClientHandler {
@@ -75,11 +89,13 @@ impl client::Handler for ClientHandler {
         &mut self,
         server_public_key: &russh::keys::PublicKeyOrCertificate,
     ) -> Result<bool, Self::Error> {
+        /*
+         * TODO: replace this with known_hosts verification.
+         *
+         * For now, print the key so it is visible while testing.
+         */
         println!("server key: {server_public_key:?}");
 
-        /*
-         * TODO: verify against known_hosts.
-         */
         Ok(true)
     }
 }
@@ -93,21 +109,16 @@ async fn main() -> Result<()> {
     println!("Loaded {} config(s)", configs.len());
 
     /*
-     * Each YAML config gets its own independent async task.
-     *
-     * This is important because every Config can have a different
-     * check_interval.
+     * Each config gets its own polling loop so configs with different
+     * check intervals can operate independently.
      */
     let mut tasks = Vec::with_capacity(configs.len());
 
     for (config_index, config) in configs.into_iter().enumerate() {
         tasks.push(tokio::spawn(async move {
-            println!(
-                "\n=== Config {} ===",
-                config_index + 1
-            );
-
-            if let Err(error) = run_config(config).await {
+            if let Err(error) =
+                run_config(config_index + 1, config).await
+            {
                 eprintln!(
                     "[config {}] ERROR: {error:#}",
                     config_index + 1
@@ -116,12 +127,6 @@ async fn main() -> Result<()> {
         }));
     }
 
-    /*
-     * Config loops are intended to run forever.
-     *
-     * Waiting on all tasks keeps main alive while still allowing
-     * the configs to operate independently.
-     */
     for task in tasks {
         task.await
             .context("configuration task panicked")?;
@@ -139,68 +144,73 @@ fn load_config(path: &Path) -> Result<Vec<Config>> {
             )
         })?;
 
-    let configs: Vec<Config> = serde_yaml::from_reader(file)
-        .with_context(|| {
-            format!(
-                "failed to parse YAML: {}",
-                path.display()
-            )
-        })?;
+    let configs: Vec<Config> =
+        serde_yaml::from_reader(file)
+            .with_context(|| {
+                format!(
+                    "failed to parse YAML: {}",
+                    path.display()
+                )
+            })?;
 
     if configs.is_empty() {
         bail!("configuration contains no configs");
     }
 
-    for (index, config) in configs.iter().enumerate() {
+    for (config_index, config) in configs.iter().enumerate() {
         if config.hosts.is_empty() {
             bail!(
                 "config {} contains no hosts",
-                index + 1
+                config_index + 1
             );
         }
 
         if config.files.is_empty() {
             bail!(
                 "config {} contains no files",
-                index + 1
+                config_index + 1
             );
         }
 
         if config.ssh_key.trim().is_empty() {
             bail!(
                 "config {} has an empty ssh_key",
-                index + 1
+                config_index + 1
             );
         }
 
         if config.check_interval == 0 {
             bail!(
                 "config {} has check_interval = 0",
-                index + 1
+                config_index + 1
             );
         }
 
-        /*
-         * Validate every source file up front so a bad path doesn't
-         * repeatedly fail every poll cycle.
-         */
         for (file_index, file) in config.files.iter().enumerate() {
-            let src = Path::new(&file.src);
-
-            if !src.is_file() {
+            if file.src.trim().is_empty() {
                 bail!(
-                    "config {} file {} source does not exist or is not a regular file: {}",
-                    index + 1,
-                    file_index + 1,
-                    src.display()
+                    "config {} file {} has an empty src",
+                    config_index + 1,
+                    file_index + 1
                 );
             }
 
             if file.dest.trim().is_empty() {
                 bail!(
-                    "config {} file {} has an empty destination",
-                    index + 1,
+                    "config {} file {} has an empty dest",
+                    config_index + 1,
                     file_index + 1
+                );
+            }
+
+            let src = Path::new(&file.src);
+
+            if !src.is_file() {
+                bail!(
+                    "config {} file {} source does not exist or is not a regular file: {}",
+                    config_index + 1,
+                    file_index + 1,
+                    src.display()
                 );
             }
         }
@@ -209,7 +219,13 @@ fn load_config(path: &Path) -> Result<Vec<Config>> {
     Ok(configs)
 }
 
-async fn run_config(config: Config) -> Result<()> {
+async fn run_config(
+    config_index: usize,
+    config: Config,
+) -> Result<()> {
+    println!();
+    println!("=== Config {} ===", config_index);
+
     let jobs: Vec<Job> = config
         .hosts
         .iter()
@@ -221,12 +237,12 @@ async fn run_config(config: Config) -> Result<()> {
         .collect();
 
     loop {
+        /*
+         * Hosts are intentionally processed sequentially in YAML order.
+         */
         for job in &jobs {
-            if let Err(error) = run_job(
-                job,
-                &config.ssh_key,
-            )
-            .await
+            if let Err(error) =
+                run_job(job, &config.ssh_key).await
             {
                 eprintln!(
                     "[{}@{}] ERROR: {error:#}",
@@ -264,53 +280,79 @@ async fn run_job(
     )
     .await?;
 
+    let transport = match job.host.transfer_method {
+        TransferMethod::Ssh => {
+            println!("transfer method: SSH");
+            Transport::Ssh
+        }
+
+        TransferMethod::Sftp => {
+            println!(
+                "transfer method: SFTP first, SSH fallback"
+            );
+
+            match try_open_sftp(&session).await {
+                Ok(sftp) => {
+                    println!("SFTP available");
+                    Transport::Sftp(sftp)
+                }
+
+                Err(error) => {
+                    println!(
+                        "SFTP unavailable: {error:#}"
+                    );
+                    println!(
+                        "falling back to SSH"
+                    );
+
+                    Transport::Ssh
+                }
+            }
+        }
+    };
+
     /*
-     * Open the SFTP subsystem.
-     */
-    let channel = session
-        .channel_open_session()
-        .await
-        .context("failed to open SSH session channel")?;
-
-    channel
-        .request_subsystem(true, "sftp")
-        .await
-        .context("failed to request SFTP subsystem")?;
-
-    let sftp = SftpSession::new_with_config(
-        channel.into_stream(),
-        russh_sftp::client::Config {
-            request_timeout_secs: 30,
-            ..Default::default()
-        },
-    )
-    .await
-    .context("failed to initialize SFTP")?;
-
-    /*
-     * Process files strictly in YAML order.
+     * Files are processed strictly in YAML order.
      */
     for file in &job.files {
-        sync_file(
-            &sftp,
-            file,
-        )
-        .await
-        .with_context(|| {
-            format!(
-                "failed syncing {} -> {}",
-                file.src,
-                file.dest
-            )
-        })?;
+        match &transport {
+            Transport::Sftp(sftp) => {
+                sync_file_sftp(
+                    sftp,
+                    file,
+                )
+                .await
+                .with_context(|| {
+                    format!(
+                        "failed syncing {} -> {}",
+                        file.src,
+                        file.dest
+                    )
+                })?;
+            }
+
+            Transport::Ssh => {
+                sync_file_ssh(
+                    &session,
+                    file,
+                )
+                .await
+                .with_context(|| {
+                    format!(
+                        "failed syncing {} -> {}",
+                        file.src,
+                        file.dest
+                    )
+                })?;
+            }
+        }
     }
 
-    /*
-     * Explicitly close the SFTP subsystem.
-     */
-    sftp.close()
-        .await
-        .context("failed to close SFTP session")?;
+    if let Transport::Sftp(sftp) = &transport {
+        sftp.close()
+            .await
+            .context("failed to close SFTP session")?;
+    }
 
     Ok(())
 }
@@ -338,14 +380,11 @@ async fn connect_ssh(
 
     let config = russh::client::Config {
         inactivity_timeout: Some(
-            Duration::from_secs(30)
+            Duration::from_secs(
+                SSH_INACTIVITY_TIMEOUT_SECS,
+            ),
         ),
-
-        /*
-         * Avoid Nagle's algorithm for SFTP traffic.
-         */
         nodelay: true,
-
         ..Default::default()
     };
 
@@ -362,15 +401,11 @@ async fn connect_ssh(
         )
     })?;
 
-    /*
-     * Russh needs to know which RSA hash algorithm the server
-     * supports when an RSA key is used.
-     */
     let rsa_hash = session
         .best_supported_rsa_hash()
         .await
         .context(
-            "failed to determine supported RSA hash algorithm"
+            "failed to determine supported RSA hash",
         )?
         .flatten();
 
@@ -410,7 +445,43 @@ async fn connect_ssh(
     Ok(session)
 }
 
-async fn sync_file(
+async fn try_open_sftp(
+    session: &russh::client::Handle<ClientHandler>,
+) -> Result<SftpSession> {
+    let channel = session
+        .channel_open_session()
+        .await
+        .context(
+            "failed to open SFTP session channel"
+        )?;
+
+    channel
+        .request_subsystem(true, "sftp")
+        .await
+        .context(
+            "SFTP subsystem request failed"
+        )?;
+
+    /*
+     * The timeout must be configured before SftpSession::new()
+     * because new_with_config() performs the initial SFTP
+     * protocol initialization.
+     */
+    let sftp = SftpSession::new_with_config(
+        channel.into_stream(),
+        russh_sftp::client::Config {
+            request_timeout_secs:
+                SFTP_REQUEST_TIMEOUT_SECS,
+            ..Default::default()
+        },
+    )
+    .await
+    .context("SFTP initialization failed")?;
+
+    Ok(sftp)
+}
+
+async fn sync_file_sftp(
     sftp: &SftpSession,
     file: &FilePair,
 ) -> Result<()> {
@@ -422,22 +493,11 @@ async fn sync_file(
         file.dest
     );
 
-    /*
-     * Calculate the source hash.
-     *
-     * This deliberately uses SHA3-256 to match your current
-     * implementation.
-     */
-    let local_hash = sha3_file(src)
-        .with_context(|| {
-            format!(
-                "failed to hash {}",
-                src.display()
-            )
-        })?;
+    let local_hash =
+        local_sha3_file(src).await?;
 
     let remote_hash =
-        remote_sha3_256(
+        remote_sha3_sftp(
             sftp,
             &file.dest,
         )
@@ -449,11 +509,9 @@ async fn sync_file(
         }
 
         Some(_) => {
-            println!(
-                "  changed; uploading"
-            );
+            println!("  changed; uploading");
 
-            upload_file(
+            upload_file_sftp(
                 sftp,
                 src,
                 &file.dest,
@@ -466,7 +524,7 @@ async fn sync_file(
                 "  destination does not exist; uploading"
             );
 
-            upload_file(
+            upload_file_sftp(
                 sftp,
                 src,
                 &file.dest,
@@ -478,27 +536,90 @@ async fn sync_file(
     Ok(())
 }
 
-fn sha3_file(
+async fn sync_file_ssh(
+    session: &russh::client::Handle<ClientHandler>,
+    file: &FilePair,
+) -> Result<()> {
+    let src = Path::new(&file.src);
+
+    println!(
+        "checking {} -> {}",
+        src.display(),
+        file.dest
+    );
+
+    let local_hash =
+        local_sha3_file(src).await?;
+
+    /*
+     * The entire remote file is streamed over SSH to the
+     * computer running this program, and hashed locally.
+     */
+    let remote_hash =
+        remote_sha3_ssh(
+            session,
+            &file.dest,
+        )
+        .await?;
+
+    match remote_hash {
+        Some(hash) if hash == local_hash => {
+            println!("  unchanged");
+        }
+
+        Some(_) => {
+            println!("  changed; uploading");
+
+            upload_file_ssh(
+                session,
+                src,
+                &file.dest,
+            )
+            .await?;
+        }
+
+        None => {
+            println!(
+                "  destination does not exist; uploading"
+            );
+
+            upload_file_ssh(
+                session,
+                src,
+                &file.dest,
+            )
+            .await?;
+        }
+    }
+
+    Ok(())
+}
+
+async fn local_sha3_file(
     path: &Path,
 ) -> Result<String> {
-    let mut file = File::open(path)?;
+    let mut file =
+        TokioFile::open(path)
+            .await
+            .with_context(|| {
+                format!(
+                    "failed to open {}",
+                    path.display()
+                )
+            })?;
 
     let mut hasher = Sha3_256::new();
-
-    let mut buffer = [0u8; 64 * 1024];
+    let mut buffer = [0u8; IO_BUFFER_SIZE];
 
     loop {
-        let count = file.read(
-            &mut buffer
-        )?;
+        let count =
+            file.read(&mut buffer).await?;
 
         if count == 0 {
             break;
         }
 
-        hasher.update(
-            &buffer[..count]
-        );
+        hasher.update(&buffer[..count]);
     }
 
     Ok(hex::encode(
@@ -506,7 +627,7 @@ fn sha3_file(
     ))
 }
 
-async fn remote_sha3_256(
+async fn remote_sha3_sftp(
     sftp: &SftpSession,
     path: &str,
 ) -> Result<Option<String>> {
@@ -515,7 +636,7 @@ async fn remote_sha3_256(
         .await
         .with_context(|| {
             format!(
-                "failed to check remote path {}",
+                "failed checking remote path {}",
                 path
             )
         })?
@@ -534,27 +655,17 @@ async fn remote_sha3_256(
         })?;
 
     let mut hasher = Sha3_256::new();
-
-    let mut buffer = [0u8; 64 * 1024];
+    let mut buffer = [0u8; IO_BUFFER_SIZE];
 
     loop {
-        let count = file
-            .read(&mut buffer)
-            .await
-            .with_context(|| {
-                format!(
-                    "failed reading remote file {}",
-                    path
-                )
-            })?;
+        let count =
+            file.read(&mut buffer).await?;
 
         if count == 0 {
             break;
         }
 
-        hasher.update(
-            &buffer[..count]
-        );
+        hasher.update(&buffer[..count]);
     }
 
     file.close()
@@ -571,14 +682,129 @@ async fn remote_sha3_256(
     ))
 }
 
-async fn upload_file(
+async fn remote_sha3_ssh(
+    session: &russh::client::Handle<ClientHandler>,
+    path: &str,
+) -> Result<Option<String>> {
+    let mut channel = session
+        .channel_open_session()
+        .await
+        .context(
+            "failed to open SSH channel for remote read"
+        )?;
+
+    let quoted_path = shell_quote(path);
+
+    /*
+     * Exit 66 means the file does not exist.
+     *
+     * Using shell redirection rather than:
+     *
+     *   cat -- <path>
+     *
+     * avoids relying on the remote cat implementation supporting
+     * the `--` option.
+     */
+    let command = format!(
+        "if [ -f {path} ]; then cat < {path}; else exit 66; fi",
+        path = quoted_path
+    );
+
+    channel
+        .exec(true, command)
+        .await
+        .context(
+            "failed to execute remote file read"
+        )?;
+
+    let mut hasher = Sha3_256::new();
+    let mut stderr = Vec::new();
+    let mut exit_status = None;
+
+    while let Some(message) = channel.wait().await {
+        match message {
+            ChannelMsg::Data { data } => {
+                hasher.update(&data);
+            }
+
+            ChannelMsg::ExtendedData {
+                data,
+                ext,
+            } => {
+                /*
+                 * SSH extended data type 1 is stderr.
+                 */
+                if ext == 1 {
+                    let remaining =
+                        4096usize.saturating_sub(stderr.len());
+
+                    let amount =
+                        remaining.min(data.len());
+
+                    stderr.extend_from_slice(
+                        &data[..amount],
+                    );
+                }
+            }
+
+            ChannelMsg::ExitStatus {
+                exit_status: status,
+            } => {
+                exit_status = Some(status);
+            }
+
+            ChannelMsg::Close => {
+                break;
+            }
+
+            _ => {}
+        }
+    }
+
+    match exit_status {
+        Some(0) => {
+            Ok(Some(
+                hex::encode(hasher.finalize())
+            ))
+        }
+
+        Some(66) => {
+            Ok(None)
+        }
+
+        Some(status) => {
+            let stderr = String::from_utf8_lossy(&stderr);
+
+            if stderr.is_empty() {
+                bail!(
+                    "remote read of {} exited with status {}",
+                    path,
+                    status
+                );
+            } else {
+                bail!(
+                    "remote read of {} exited with status {}: {}",
+                    path,
+                    status,
+                    stderr.trim()
+                );
+            }
+        }
+
+        None => {
+            bail!(
+                "remote read of {} closed without an exit status",
+                path
+            );
+        }
+    }
+}
+
+async fn upload_file_sftp(
     sftp: &SftpSession,
     src: &Path,
     dest: &str,
 ) -> Result<()> {
-    /*
-     * Make sure the remote parent exists.
-     */
     if let Some(parent) = remote_parent(dest) {
         create_remote_directories(
             sftp,
@@ -587,18 +813,12 @@ async fn upload_file(
         .await?;
     }
 
-    /*
-     * Upload to a temporary file first.
-     *
-     * If the transfer fails, the destination isn't modified.
-     */
-    let temporary = format!(
-        "{}.tmp",
-        dest
-    );
+    let temporary =
+        format!("{}.tmp", dest);
 
     /*
-     * Clean up an old temporary file from a previous failed run.
+     * Remove a stale temp file left over from an interrupted
+     * previous transfer.
      */
     if sftp
         .try_exists(&temporary)
@@ -620,14 +840,15 @@ async fn upload_file(
             })?;
     }
 
-    let mut local = TokioFile::open(src)
-        .await
-        .with_context(|| {
-            format!(
-                "failed to open local file {}",
-                src.display()
-            )
-        })?;
+    let mut local =
+        TokioFile::open(src)
+            .await
+            .with_context(|| {
+                format!(
+                    "failed to open local file {}",
+                    src.display()
+                )
+            })?;
 
     let mut remote = sftp
         .open_with_flags(
@@ -644,69 +865,48 @@ async fn upload_file(
             )
         })?;
 
-    let mut buffer = [0u8; 64 * 1024];
-
-    loop {
-        let count = local
-            .read(&mut buffer)
-            .await
-            .with_context(|| {
-                format!(
-                    "failed reading local file {}",
-                    src.display()
-                )
-            })?;
-
-        if count == 0 {
-            break;
-        }
-
-        remote
-            .write_all(&buffer[..count])
-            .await
-            .with_context(|| {
-                format!(
-                    "failed writing remote temporary file {}",
-                    temporary
-                )
-            })?;
-    }
+    tokio::io::copy(
+        &mut local,
+        &mut remote,
+    )
+    .await
+    .with_context(|| {
+        format!(
+            "failed uploading {} -> {}",
+            src.display(),
+            temporary
+        )
+    })?;
 
     remote
         .flush()
         .await
         .with_context(|| {
             format!(
-                "failed flushing remote temporary file {}",
+                "failed flushing {}",
                 temporary
             )
         })?;
 
-    /*
-     * close() waits for pending writes to complete and reports
-     * the remote close result.
-     */
     remote
         .close()
         .await
         .with_context(|| {
             format!(
-                "failed closing remote temporary file {}",
+                "failed closing {}",
                 temporary
             )
         })?;
 
     /*
-     * SFTP v3 rename does not necessarily overwrite an existing
-     * destination. Remove the old destination only after the new
-     * file has been completely uploaded.
+     * Replace the destination only after the complete upload.
      */
     if sftp
         .try_exists(dest)
         .await
         .with_context(|| {
             format!(
-                "failed checking existing destination {}",
+                "failed checking destination {}",
                 dest
             )
         })?
@@ -715,7 +915,7 @@ async fn upload_file(
             .await
             .with_context(|| {
                 format!(
-                    "failed removing existing destination {}",
+                    "failed removing destination {}",
                     dest
                 )
             })?;
@@ -739,19 +939,262 @@ async fn upload_file(
     Ok(())
 }
 
-fn remote_parent(
-    path: &str,
-) -> Option<&str> {
-    match path.rsplit_once('/') {
-        Some((parent, _filename)) => {
-            if parent.is_empty() {
-                Some("/")
+async fn upload_file_ssh(
+    session: &russh::client::Handle<ClientHandler>,
+    src: &Path,
+    dest: &str,
+) -> Result<()> {
+    let temporary =
+        format!("{}.tmp", dest);
+
+    /*
+     * mkdir -p and cat are part of one shell command, so the file
+     * is never created if the parent directory cannot be created.
+     */
+    let parent_command = match remote_parent(dest) {
+        Some(parent) => {
+            let quoted_parent =
+                shell_quote(parent);
+
+            format!(
+                "mkdir -p {parent}",
+                parent = quoted_parent
+            )
+        }
+
+        None => String::from(":"),
+    };
+
+    let quoted_temporary =
+        shell_quote(&temporary);
+
+    let command = format!(
+        "{mkdir} && cat > {temporary}",
+        mkdir = parent_command,
+        temporary = quoted_temporary,
+    );
+
+    let mut channel = session
+        .channel_open_session()
+        .await
+        .context(
+            "failed to open SSH channel for upload"
+        )?;
+
+    channel
+        .exec(true, command)
+        .await
+        .context(
+            "failed to start remote upload"
+        )?;
+
+    let local =
+        TokioFile::open(src)
+            .await
+            .with_context(|| {
+                format!(
+                    "failed to open local file {}",
+                    src.display()
+                )
+            })?;
+
+    /*
+     * Stream the local file into the remote command's stdin.
+     */
+    channel
+        .data(local)
+        .await
+        .with_context(|| {
+            format!(
+                "failed streaming {} to remote host",
+                src.display()
+            )
+        })?;
+
+    /*
+     * Tell remote cat that the input file is complete.
+     */
+    channel
+        .eof()
+        .await
+        .context(
+            "failed sending upload EOF"
+        )?;
+
+    let mut stderr = Vec::new();
+    let mut exit_status = None;
+
+    while let Some(message) = channel.wait().await {
+        match message {
+            ChannelMsg::ExtendedData {
+                data,
+                ext,
+            } => {
+                if ext == 1 {
+                    let remaining =
+                        4096usize.saturating_sub(stderr.len());
+
+                    let amount =
+                        remaining.min(data.len());
+
+                    stderr.extend_from_slice(
+                        &data[..amount],
+                    );
+                }
+            }
+
+            ChannelMsg::ExitStatus {
+                exit_status: status,
+            } => {
+                exit_status = Some(status);
+            }
+
+            ChannelMsg::Close => {
+                break;
+            }
+
+            _ => {}
+        }
+    }
+
+    match exit_status {
+        Some(0) => {}
+
+        Some(status) => {
+            let stderr =
+                String::from_utf8_lossy(&stderr);
+
+            if stderr.is_empty() {
+                bail!(
+                    "remote upload command exited with status {}",
+                    status
+                );
             } else {
-                Some(parent)
+                bail!(
+                    "remote upload command exited with status {}: {}",
+                    status,
+                    stderr.trim()
+                );
             }
         }
 
-        None => None,
+        None => {
+            bail!(
+                "remote upload command closed without an exit status"
+            );
+        }
+    }
+
+    /*
+     * The upload succeeded. Now atomically-ish replace the
+     * destination using the remote `mv` operation.
+     */
+    let move_command = format!(
+        "mv -f {temporary} {destination}",
+        temporary = shell_quote(&temporary),
+        destination = shell_quote(dest),
+    );
+
+    exec_checked(
+        session,
+        &move_command,
+    )
+    .await
+    .with_context(|| {
+        format!(
+            "failed replacing destination {}",
+            dest
+        )
+    })?;
+
+    println!("  uploaded");
+
+    Ok(())
+}
+
+async fn exec_checked(
+    session: &russh::client::Handle<ClientHandler>,
+    command: &str,
+) -> Result<()> {
+    let mut channel = session
+        .channel_open_session()
+        .await
+        .context(
+            "failed to open SSH command channel"
+        )?;
+
+    channel
+        .exec(true, command)
+        .await
+        .with_context(|| {
+            format!(
+                "failed to execute remote command: {}",
+                command
+            )
+        })?;
+
+    let mut stderr = Vec::new();
+    let mut exit_status = None;
+
+    while let Some(message) = channel.wait().await {
+        match message {
+            ChannelMsg::ExtendedData {
+                data,
+                ext,
+            } => {
+                if ext == 1 {
+                    let remaining =
+                        4096usize.saturating_sub(stderr.len());
+
+                    let amount =
+                        remaining.min(data.len());
+
+                    stderr.extend_from_slice(
+                        &data[..amount],
+                    );
+                }
+            }
+
+            ChannelMsg::ExitStatus {
+                exit_status: status,
+            } => {
+                exit_status = Some(status);
+            }
+
+            ChannelMsg::Close => {
+                break;
+            }
+
+            _ => {}
+        }
+    }
+
+    match exit_status {
+        Some(0) => Ok(()),
+
+        Some(status) => {
+            let stderr =
+                String::from_utf8_lossy(&stderr);
+
+            if stderr.is_empty() {
+                bail!(
+                    "remote command exited with status {}",
+                    status
+                );
+            } else {
+                bail!(
+                    "remote command exited with status {}: {}",
+                    status,
+                    stderr.trim()
+                );
+            }
+        }
+
+        None => {
+            bail!(
+                "remote command closed without an exit status"
+            );
+        }
     }
 }
 
@@ -808,4 +1251,39 @@ async fn create_remote_directories(
     }
 
     Ok(())
+}
+
+fn remote_parent(path: &str) -> Option<&str> {
+    match path.rsplit_once('/') {
+        Some((parent, _filename)) => {
+            if parent.is_empty() {
+                Some("/")
+            } else {
+                Some(parent)
+            }
+        }
+
+        None => None,
+    }
+}
+
+/*
+ * Quote a string for a POSIX shell using single quotes.
+ *
+ * Example:
+ *
+ *   abc'def
+ *
+ * becomes:
+ *
+ *   'abc'"'"'def'
+ */
+fn shell_quote(value: &str) -> String {
+    format!(
+        "'{}'",
+        value.replace(
+            '\'',
+            "'\"'\"'"
+        )
+    )
 }
