@@ -1,21 +1,27 @@
 use std::{
     fs::File,
-    io::{Read, Write},
-    net::TcpStream,
+    io::Read,
     path::{Path, PathBuf},
-    thread,
+    sync::Arc,
     time::Duration,
 };
 
 use anyhow::{bail, Context, Result};
 use clap::Parser;
-use serde::{Deserialize, Serialize};
-use sha3::{Digest, Sha3_256};
-use ssh2::{Session, Sftp};
 use russh::{
     client,
     keys::{load_secret_key, PrivateKeyWithHashAlg},
-    ChannelId,
+};
+use russh_sftp::{
+    client::SftpSession,
+    protocol::OpenFlags,
+};
+use serde::{Deserialize, Serialize};
+use sha3::{Digest, Sha3_256};
+use tokio::{
+    fs::File as TokioFile,
+    io::{AsyncReadExt, AsyncWriteExt},
+    time::sleep,
 };
 
 #[derive(Parser, Debug)]
@@ -51,21 +57,74 @@ struct Job {
     files: Vec<FilePair>,
 }
 
-fn main() -> Result<()> {
+/*
+ * SSH client handler.
+ *
+ * IMPORTANT:
+ * check_server_key() currently accepts any server key.
+ *
+ * That is convenient while getting the program working, but it
+ * should eventually verify ~/.ssh/known_hosts.
+ */
+struct ClientHandler;
+
+impl client::Handler for ClientHandler {
+    type Error = anyhow::Error;
+
+    async fn check_server_key(
+        &mut self,
+        server_public_key: &russh::keys::PublicKeyOrCertificate,
+    ) -> Result<bool, Self::Error> {
+        println!("server key: {server_public_key:?}");
+
+        /*
+         * TODO: verify against known_hosts.
+         */
+        Ok(true)
+    }
+}
+
+#[tokio::main]
+async fn main() -> Result<()> {
     let args = Args::parse();
 
     let configs = load_config(&args.config)?;
 
     println!("Loaded {} config(s)", configs.len());
 
-    for (config_index, config) in configs.iter().enumerate() {
-        println!(
-            "\n=== Config {} / {} ===",
-            config_index + 1,
-            configs.len()
-        );
+    /*
+     * Each YAML config gets its own independent async task.
+     *
+     * This is important because every Config can have a different
+     * check_interval.
+     */
+    let mut tasks = Vec::with_capacity(configs.len());
 
-        run_config(config)?;
+    for (config_index, config) in configs.into_iter().enumerate() {
+        tasks.push(tokio::spawn(async move {
+            println!(
+                "\n=== Config {} ===",
+                config_index + 1
+            );
+
+            if let Err(error) = run_config(config).await {
+                eprintln!(
+                    "[config {}] ERROR: {error:#}",
+                    config_index + 1
+                );
+            }
+        }));
+    }
+
+    /*
+     * Config loops are intended to run forever.
+     *
+     * Waiting on all tasks keeps main alive while still allowing
+     * the configs to operate independently.
+     */
+    for task in tasks {
+        task.await
+            .context("configuration task panicked")?;
     }
 
     Ok(())
@@ -73,10 +132,20 @@ fn main() -> Result<()> {
 
 fn load_config(path: &Path) -> Result<Vec<Config>> {
     let file = File::open(path)
-        .with_context(|| format!("failed to open config: {}", path.display()))?;
+        .with_context(|| {
+            format!(
+                "failed to open config: {}",
+                path.display()
+            )
+        })?;
 
     let configs: Vec<Config> = serde_yaml::from_reader(file)
-        .with_context(|| format!("failed to parse YAML: {}", path.display()))?;
+        .with_context(|| {
+            format!(
+                "failed to parse YAML: {}",
+                path.display()
+            )
+        })?;
 
     if configs.is_empty() {
         bail!("configuration contains no configs");
@@ -84,25 +153,63 @@ fn load_config(path: &Path) -> Result<Vec<Config>> {
 
     for (index, config) in configs.iter().enumerate() {
         if config.hosts.is_empty() {
-            bail!("config {} contains no hosts", index + 1);
+            bail!(
+                "config {} contains no hosts",
+                index + 1
+            );
         }
 
         if config.files.is_empty() {
-            bail!("config {} contains no files", index + 1);
+            bail!(
+                "config {} contains no files",
+                index + 1
+            );
         }
 
-        if config.ssh_key.is_empty() {
-            bail!("config {} has an empty ssh_key", index + 1);
+        if config.ssh_key.trim().is_empty() {
+            bail!(
+                "config {} has an empty ssh_key",
+                index + 1
+            );
+        }
+
+        if config.check_interval == 0 {
+            bail!(
+                "config {} has check_interval = 0",
+                index + 1
+            );
+        }
+
+        /*
+         * Validate every source file up front so a bad path doesn't
+         * repeatedly fail every poll cycle.
+         */
+        for (file_index, file) in config.files.iter().enumerate() {
+            let src = Path::new(&file.src);
+
+            if !src.is_file() {
+                bail!(
+                    "config {} file {} source does not exist or is not a regular file: {}",
+                    index + 1,
+                    file_index + 1,
+                    src.display()
+                );
+            }
+
+            if file.dest.trim().is_empty() {
+                bail!(
+                    "config {} file {} has an empty destination",
+                    index + 1,
+                    file_index + 1
+                );
+            }
         }
     }
 
     Ok(configs)
 }
 
-fn run_config(config: &Config) -> Result<()> {
-    /*
-     * Construct jobs in the same order as the YAML.
-     */
+async fn run_config(config: Config) -> Result<()> {
     let jobs: Vec<Job> = config
         .hosts
         .iter()
@@ -115,67 +222,128 @@ fn run_config(config: &Config) -> Result<()> {
 
     loop {
         for job in &jobs {
-            if let Err(error) = run_job(job, &config.ssh_key) {
+            if let Err(error) = run_job(
+                job,
+                &config.ssh_key,
+            )
+            .await
+            {
                 eprintln!(
                     "[{}@{}] ERROR: {error:#}",
-                    job.host.user, job.host.host
+                    job.host.user,
+                    job.host.host
                 );
             }
         }
 
-        thread::sleep(Duration::from_secs(config.check_interval));
+        println!(
+            "\nnext check in {} second(s)",
+            config.check_interval
+        );
+
+        sleep(Duration::from_secs(
+            config.check_interval,
+        ))
+        .await;
     }
 }
 
-fn run_job(job: &Job, ssh_key: &str) -> Result<()> {
+async fn run_job(
+    job: &Job,
+    ssh_key: &str,
+) -> Result<()> {
     println!(
         "\n--- {}@{} ---",
-        job.host.user, job.host.host
+        job.host.user,
+        job.host.host
     );
 
-    let session = connect_ssh(&job.host, ssh_key)?;
+    let session = connect_ssh(
+        &job.host,
+        ssh_key,
+    )
+    .await?;
 
     /*
-     * Files are intentionally processed sequentially in the order
-     * specified by the YAML.
+     * Open the SFTP subsystem.
+     */
+    let channel = session
+        .channel_open_session()
+        .await
+        .context("failed to open SSH session channel")?;
+
+    channel
+        .request_subsystem(true, "sftp")
+        .await
+        .context("failed to request SFTP subsystem")?;
+
+    let sftp = SftpSession::new(
+        channel.into_stream()
+    )
+    .await
+    .context("failed to initialize SFTP")?;
+
+    sftp.set_timeout(30);
+
+    /*
+     * Process files strictly in YAML order.
      */
     for file in &job.files {
-        sync_file(&session, file)?;
+        sync_file(
+            &sftp,
+            file,
+        )
+        .await
+        .with_context(|| {
+            format!(
+                "failed syncing {} -> {}",
+                file.src,
+                file.dest
+            )
+        })?;
     }
+
+    /*
+     * Explicitly close the SFTP subsystem.
+     */
+    sftp.close()
+        .await
+        .context("failed to close SFTP session")?;
 
     Ok(())
-}
-
-struct ClientHandler;
-
-impl client::Handler for ClientHandler {
-    type Error = anyhow::Error;
-
-    async fn check_server_key(
-        &mut self,
-        _server_public_key: &russh::keys::PublicKeyOrCertificate,
-    ) -> Result<bool, Self::Error> {
-        /*
-         * Do not blindly return true in a production program.
-         *
-         * This is equivalent to accepting any host key, which is
-         * convenient while getting the synchronization program working.
-         */
-        Ok(true)
-    }
 }
 
 async fn connect_ssh(
     host: &SSHInfo,
     ssh_key: &str,
 ) -> Result<russh::client::Handle<ClientHandler>> {
-    let key = load_secret_key(Path::new(ssh_key), None)
-        .with_context(|| {
-            format!("failed to load SSH private key: {ssh_key}")
-        })?;
+    println!(
+        "connecting to {}@{}",
+        host.user,
+        host.host
+    );
+
+    let private_key = load_secret_key(
+        Path::new(ssh_key),
+        None,
+    )
+    .with_context(|| {
+        format!(
+            "failed to load SSH private key: {}",
+            ssh_key
+        )
+    })?;
 
     let config = russh::client::Config {
-        inactivity_timeout: Some(std::time::Duration::from_secs(30)),
+        inactivity_timeout: Some(
+            Duration::from_secs(30)
+        ),
+
+        /*
+         * Avoid Nagle's algorithm for SFTP traffic.
+         */
+        nodelay: true,
+
         ..Default::default()
     };
 
@@ -186,21 +354,40 @@ async fn connect_ssh(
     )
     .await
     .with_context(|| {
-        format!("failed to connect to {}:22", host.host)
+        format!(
+            "failed to connect to {}:22",
+            host.host
+        )
     })?;
 
+    /*
+     * Russh needs to know which RSA hash algorithm the server
+     * supports when an RSA key is used.
+     */
+    let rsa_hash = session
+        .best_supported_rsa_hash()
+        .await
+        .context(
+            "failed to determine supported RSA hash algorithm"
+        )?
+        .flatten();
+
     let key = PrivateKeyWithHashAlg::new(
-        Arc::new(key),
-        session.best_supported_rsa_hash().await?.flatten(),
+        Arc::new(private_key),
+        rsa_hash,
     );
 
     let auth = session
-        .authenticate_publickey(&host.user, key)
+        .authenticate_publickey(
+            &host.user,
+            key,
+        )
         .await
         .with_context(|| {
             format!(
                 "public-key authentication failed for {}@{}",
-                host.user, host.host
+                host.user,
+                host.host
             )
         })?;
 
@@ -214,21 +401,45 @@ async fn connect_ssh(
 
     println!(
         "authenticated {}@{}",
-        host.user, host.host
+        host.user,
+        host.host
     );
 
     Ok(session)
 }
 
-fn sync_file(session: &Session, file: &FilePair) -> Result<()> {
+async fn sync_file(
+    sftp: &SftpSession,
+    file: &FilePair,
+) -> Result<()> {
     let src = Path::new(&file.src);
 
-    println!("checking {} -> {}", src.display(), file.dest);
+    println!(
+        "checking {} -> {}",
+        src.display(),
+        file.dest
+    );
 
-    let local_hash = sha256_file(src)
-        .with_context(|| format!("failed to hash {}", src.display()))?;
+    /*
+     * Calculate the source hash.
+     *
+     * This deliberately uses SHA3-256 to match your current
+     * implementation.
+     */
+    let local_hash = sha3_file(src)
+        .with_context(|| {
+            format!(
+                "failed to hash {}",
+                src.display()
+            )
+        })?;
 
-    let remote_hash = remote_sha256(session, &file.dest)?;
+    let remote_hash =
+        remote_sha3_256(
+            sftp,
+            &file.dest,
+        )
+        .await?;
 
     match remote_hash {
         Some(hash) if hash == local_hash => {
@@ -236,160 +447,287 @@ fn sync_file(session: &Session, file: &FilePair) -> Result<()> {
         }
 
         Some(_) => {
-            println!("  changed; uploading");
-            upload_file(session, src, &file.dest)?;
+            println!(
+                "  changed; uploading"
+            );
+
+            upload_file(
+                sftp,
+                src,
+                &file.dest,
+            )
+            .await?;
         }
 
         None => {
-            println!("  destination does not exist; uploading");
-            upload_file(session, src, &file.dest)?;
+            println!(
+                "  destination does not exist; uploading"
+            );
+
+            upload_file(
+                sftp,
+                src,
+                &file.dest,
+            )
+            .await?;
         }
     }
 
     Ok(())
 }
 
-fn sha256_file(path: &Path) -> Result<String> {
+fn sha3_file(
+    path: &Path,
+) -> Result<String> {
     let mut file = File::open(path)?;
 
     let mut hasher = Sha3_256::new();
-    let mut buffer = [0u8; 1024 * 64];
+
+    let mut buffer = [0u8; 64 * 1024];
 
     loop {
-        let count = file.read(&mut buffer)?;
+        let count = file.read(
+            &mut buffer
+        )?;
 
         if count == 0 {
             break;
         }
 
-        hasher.update(&buffer[..count]);
+        hasher.update(
+            &buffer[..count]
+        );
     }
 
-    Ok(hex::encode(hasher.finalize()))
+    Ok(hex::encode(
+        hasher.finalize()
+    ))
 }
 
-fn remote_sha256(session: &Session, path: &str) -> Result<Option<String>> {
-    /*
-     * Use SFTP rather than a remote shell command. This avoids
-     * shell quoting issues with filenames.
-     */
-    let sftp = session.sftp()?;
-
-    match sftp.open(Path::new(path)) {
-        Ok(mut file) => {
-            let mut hasher = Sha3_256::new();
-            let mut buffer = [0u8; 1024 * 64];
-
-            loop {
-                let count = file.read(&mut buffer)?;
-
-                if count == 0 {
-                    break;
-                }
-
-                hasher.update(&buffer[..count]);
-            }
-
-            Ok(Some(hex::encode(hasher.finalize())))
-        }
-
-        Err(error) => {
-            /*
-             * SFTP doesn't provide a particularly convenient
-             * cross-platform "not found" API, so check whether
-             * the path exists separately.
-             */
-            if !remote_exists(&sftp, path) {
-                Ok(None)
-            } else {
-                Err(error.into())
-            }
-        }
-    }
-}
-
-fn remote_exists(sftp: &Sftp, path: &str) -> bool {
-    sftp.stat(Path::new(path)).is_ok()
-}
-
-fn upload_file(
-    session: &Session,
-    src: &Path,
-    dest: &str,
-) -> Result<()> {
-    let sftp = session
-        .sftp()
-        .context("failed to initialize SFTP")?;
-
-    let metadata = std::fs::metadata(src)
-        .with_context(|| format!("failed to stat {}", src.display()))?;
-
-    /*
-     * Ensure the destination's parent directory exists.
-     *
-     * SFTP mkdir is intentionally not recursive, so create each
-     * component separately.
-     */
-    if let Some(parent) = Path::new(dest).parent() {
-        create_remote_directories(&sftp, parent)?;
-    }
-
-    /*
-     * Upload to a temporary file first. This prevents the remote
-     * destination from being left partially written if the transfer
-     * fails.
-     */
-    let temporary = format!("{}.tmp", dest);
-
+async fn remote_sha3_256(
+    sftp: &SftpSession,
+    path: &str,
+) -> Result<Option<String>> {
+    if !sftp
+        .try_exists(path)
+        .await
+        .with_context(|| {
+            format!(
+                "failed to check remote path {}",
+                path
+            )
+        })?
     {
-        let mut remote = sftp
-            .create(Path::new(&temporary))
-            .with_context(|| {
-                format!("failed to create remote file {temporary}")
-            })?;
+        return Ok(None);
+    }
 
-        let mut local = File::open(src)
-            .with_context(|| format!("failed to open {}", src.display()))?;
+    let mut file = sftp
+        .open(path)
+        .await
+        .with_context(|| {
+            format!(
+                "failed to open remote file {}",
+                path
+            )
+        })?;
 
-        std::io::copy(&mut local, &mut remote)
+    let mut hasher = Sha3_256::new();
+
+    let mut buffer = [0u8; 64 * 1024];
+
+    loop {
+        let count = file
+            .read(&mut buffer)
+            .await
             .with_context(|| {
                 format!(
-                    "failed uploading {} -> {}",
-                    src.display(),
-                    temporary
+                    "failed reading remote file {}",
+                    path
                 )
             })?;
 
-        remote.flush()?;
+        if count == 0 {
+            break;
+        }
+
+        hasher.update(
+            &buffer[..count]
+        );
+    }
+
+    file.close()
+        .await
+        .with_context(|| {
+            format!(
+                "failed closing remote file {}",
+                path
+            )
+        })?;
+
+    Ok(Some(
+        hex::encode(hasher.finalize())
+    ))
+}
+
+async fn upload_file(
+    sftp: &SftpSession,
+    src: &Path,
+    dest: &str,
+) -> Result<()> {
+    /*
+     * Make sure the remote parent exists.
+     */
+    if let Some(parent) = remote_parent(dest) {
+        create_remote_directories(
+            sftp,
+            parent,
+        )
+        .await?;
     }
 
     /*
-     * Preserve the local file's Unix permissions where possible.
+     * Upload to a temporary file first.
+     *
+     * If the transfer fails, the destination isn't modified.
      */
-    #[cfg(unix)]
+    let temporary = format!(
+        "{}.tmp",
+        dest
+    );
+
+    /*
+     * Clean up an old temporary file from a previous failed run.
+     */
+    if sftp
+        .try_exists(&temporary)
+        .await
+        .with_context(|| {
+            format!(
+                "failed checking temporary file {}",
+                temporary
+            )
+        })?
     {
-        use std::os::unix::fs::PermissionsExt;
-
-        let mode = metadata.permissions().mode() & 0o7777;
-
-        let mut stat = ssh2::FileStat::default();
-        stat.perm = Some(mode);
-
-        let _ = sftp.setstat(Path::new(&temporary), stat);
+        sftp.remove_file(&temporary)
+            .await
+            .with_context(|| {
+                format!(
+                    "failed removing stale temporary file {}",
+                    temporary
+                )
+            })?;
     }
 
+    let mut local = TokioFile::open(src)
+        .await
+        .with_context(|| {
+            format!(
+                "failed to open local file {}",
+                src.display()
+            )
+        })?;
+
+    let mut remote = sftp
+        .open_with_flags(
+            &temporary,
+            OpenFlags::CREATE
+                | OpenFlags::TRUNCATE
+                | OpenFlags::WRITE,
+        )
+        .await
+        .with_context(|| {
+            format!(
+                "failed creating remote temporary file {}",
+                temporary
+            )
+        })?;
+
+    let mut buffer = [0u8; 64 * 1024];
+
+    loop {
+        let count = local
+            .read(&mut buffer)
+            .await
+            .with_context(|| {
+                format!(
+                    "failed reading local file {}",
+                    src.display()
+                )
+            })?;
+
+        if count == 0 {
+            break;
+        }
+
+        remote
+            .write_all(&buffer[..count])
+            .await
+            .with_context(|| {
+                format!(
+                    "failed writing remote temporary file {}",
+                    temporary
+                )
+            })?;
+    }
+
+    remote
+        .flush()
+        .await
+        .with_context(|| {
+            format!(
+                "failed flushing remote temporary file {}",
+                temporary
+            )
+        })?;
+
     /*
-     * Rename is atomic on the same filesystem, so the destination
-     * never becomes a partially uploaded file.
+     * close() waits for pending writes to complete and reports
+     * the remote close result.
      */
+    remote
+        .close()
+        .await
+        .with_context(|| {
+            format!(
+                "failed closing remote temporary file {}",
+                temporary
+            )
+        })?;
+
+    /*
+     * SFTP v3 rename does not necessarily overwrite an existing
+     * destination. Remove the old destination only after the new
+     * file has been completely uploaded.
+     */
+    if sftp
+        .try_exists(dest)
+        .await
+        .with_context(|| {
+            format!(
+                "failed checking existing destination {}",
+                dest
+            )
+        })?
+    {
+        sftp.remove_file(dest)
+            .await
+            .with_context(|| {
+                format!(
+                    "failed removing existing destination {}",
+                    dest
+                )
+            })?;
+    }
+
     sftp.rename(
-        Path::new(&temporary),
-        Path::new(dest),
-        None,
+        &temporary,
+        dest,
     )
+    .await
     .with_context(|| {
         format!(
-            "failed to replace remote destination {}",
+            "failed renaming {} -> {}",
+            temporary,
             dest
         )
     })?;
@@ -399,37 +737,71 @@ fn upload_file(
     Ok(())
 }
 
-fn create_remote_directories(
-    sftp: &Sftp,
-    path: &Path,
+fn remote_parent(
+    path: &str,
+) -> Option<&str> {
+    match path.rsplit_once('/') {
+        Some((parent, _filename)) => {
+            if parent.is_empty() {
+                Some("/")
+            } else {
+                Some(parent)
+            }
+        }
+
+        None => None,
+    }
+}
+
+async fn create_remote_directories(
+    sftp: &SftpSession,
+    path: &str,
 ) -> Result<()> {
-    let mut current = PathBuf::new();
+    if path.is_empty() || path == "/" {
+        return Ok(());
+    }
 
-    for component in path.components() {
-        current.push(component);
+    let absolute = path.starts_with('/');
 
-        match sftp.stat(&current) {
-            Ok(stat) => {
-                /*
-                 * It exists. Continue.
-                 */
-                if stat.perm.is_none() {
-                    continue;
-                }
-            }
+    let mut current = if absolute {
+        String::from("/")
+    } else {
+        String::new()
+    };
 
-            Err(_) => {
-                /*
-                 * Directory doesn't exist.
-                 */
-                sftp.mkdir(&current, 0o755)
-                    .with_context(|| {
-                        format!(
-                            "failed to create remote directory {}",
-                            current.display()
-                        )
-                    })?;
-            }
+    for component in path.split('/') {
+        if component.is_empty()
+            || component == "."
+        {
+            continue;
+        }
+
+        if !current.is_empty()
+            && !current.ends_with('/')
+        {
+            current.push('/');
+        }
+
+        current.push_str(component);
+
+        if !sftp
+            .try_exists(&current)
+            .await
+            .with_context(|| {
+                format!(
+                    "failed checking remote directory {}",
+                    current
+                )
+            })?
+        {
+            sftp.create_dir(&current)
+                .await
+                .with_context(|| {
+                    format!(
+                        "failed creating remote directory {}",
+                        current
+                    )
+                })?;
         }
     }
 
