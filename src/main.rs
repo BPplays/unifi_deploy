@@ -277,13 +277,15 @@ async fn run_job(
         .await
         .context("failed to request SFTP subsystem")?;
 
-    let sftp = SftpSession::new(
-        channel.into_stream()
+    let sftp = SftpSession::new_with_config(
+        channel.into_stream(),
+        russh_sftp::client::Config {
+            request_timeout_secs: 30,
+            ..Default::default()
+        },
     )
     .await
     .context("failed to initialize SFTP")?;
-
-    sftp.set_timeout(30);
 
     /*
      * Process files strictly in YAML order.
