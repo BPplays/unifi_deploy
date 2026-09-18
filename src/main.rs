@@ -69,7 +69,7 @@ struct Config {
     check_interval: u64,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct Job {
     host: SSHInfo,
     files: Vec<FilePair>,
@@ -238,18 +238,38 @@ async fn run_config(
 
     loop {
         /*
-         * Hosts are intentionally processed sequentially in YAML order.
+         * Start every host at the same time.
+         *
+         * Each host gets its own task, so connecting to one host
+         * does not block the other hosts.
          */
-        for job in &jobs {
-            if let Err(error) =
-                run_job(job, &config.ssh_key).await
-            {
-                eprintln!(
-                    "[{}@{}] ERROR: {error:#}",
-                    job.host.user,
-                    job.host.host
-                );
-            }
+        let mut tasks = Vec::with_capacity(jobs.len());
+
+        for job in jobs.iter().cloned() {
+            let ssh_key = config.ssh_key.clone();
+
+            tasks.push(tokio::spawn(async move {
+                let host_name =
+                    format!("{}@{}", job.host.user, job.host.host);
+
+                if let Err(error) =
+                    run_job(&job, &ssh_key).await
+                {
+                    eprintln!(
+                        "[{}] ERROR: {error:#}",
+                        host_name
+                    );
+                }
+            }));
+        }
+
+        /*
+         * Wait for all hosts to finish before starting the
+         * next polling interval.
+         */
+        for task in tasks {
+            task.await
+                .context("host task panicked")?;
         }
 
         println!(
